@@ -264,15 +264,6 @@ func TestWatchAddAfterStop(t *testing.T) {
 	}
 }
 
-type schemeWithPatchMeta struct {
-	*runtime.Scheme
-	patchMeta map[schema.GroupVersionKind]strategicpatch.LookupPatchMeta
-}
-
-func (s *schemeWithPatchMeta) PatchMeta(kind schema.GroupVersionKind) strategicpatch.LookupPatchMeta {
-	return s.patchMeta[kind]
-}
-
 func TestPatch(t *testing.T) {
 
 	t.Run("WithMissingObject", func(t *testing.T) {
@@ -303,14 +294,14 @@ func TestPatch(t *testing.T) {
 		targetMeta, err := strategicpatch.NewPatchMetaFromStruct(targetObject)
 		assert.NoError(t, err)
 
-		schemeWithPatchMeta := schemeWithPatchMeta{
-			Scheme: scheme,
-			patchMeta: map[schema.GroupVersionKind]strategicpatch.LookupPatchMeta{
+		schemeWithPatchMeta := NewSchemeWithPatchMeta(
+			scheme,
+			map[schema.GroupVersionKind]strategicpatch.LookupPatchMeta{
 				configmapsGvk: targetMeta,
 			},
-		}
+		)
 
-		o := NewObjectTracker(&schemeWithPatchMeta, codecs.UniversalDecoder())
+		o := NewObjectTracker(schemeWithPatchMeta, codecs.UniversalDecoder())
 
 		unstructuredObj := &unstructured.Unstructured{
 			Object: map[string]interface{}{

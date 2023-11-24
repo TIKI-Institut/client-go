@@ -67,8 +67,8 @@ type ObjectTracker interface {
 	// which will push added / modified / deleted object.
 	Watch(gvr schema.GroupVersionResource, ns string) (watch.Interface, error)
 
-	// LookupPatchMeta returns the needed meta information to perform patches on any object with schema.GroupVersionKind <kind>.
-	LookupPatchMeta(kind schema.GroupVersionKind) strategicpatch.LookupPatchMeta
+	// LookupPatchMeta returns the needed meta information to perform patches on any object the type represented in <obj>.
+	LookupPatchMeta(obj runtime.Object) strategicpatch.LookupPatchMeta
 }
 
 // ObjectScheme abstracts the implementation of common operations on objects.
@@ -189,18 +189,17 @@ func ObjectReaction(tracker ObjectTracker) ReactionFunc {
 					return true, nil, err
 				}
 			case types.StrategicMergePatchType, types.ApplyPatchType:
-				objGvk := obj.GetObjectKind().GroupVersionKind()
+				//objGvk := obj.GetObjectKind().GroupVersionKind()
 
-				schema := tracker.LookupPatchMeta(objGvk)
-				if schema == nil {
-					schema, err = strategicpatch.NewPatchMetaFromStruct(obj)
+				patchSchema := tracker.LookupPatchMeta(obj)
+				if patchSchema == nil {
+					patchSchema, err = strategicpatch.NewPatchMetaFromStruct(obj)
 					if err != nil {
 						return true, nil, err
 					}
 				}
 
-				mergedByte, err := strategicpatch.StrategicMergePatchUsingLookupPatchMeta(old, action.GetPatch(), schema)
-				//mergedByte, err := strategicpatch.StrategicMergePatch(old, action.GetPatch(), dataStruct)
+				mergedByte, err := strategicpatch.StrategicMergePatchUsingLookupPatchMeta(old, action.GetPatch(), patchSchema)
 				if err != nil {
 					return true, nil, err
 				}
@@ -238,11 +237,11 @@ type tracker struct {
 	watchers map[schema.GroupVersionResource]map[string][]*watch.RaceFreeFakeWatcher
 }
 
-func (t *tracker) LookupPatchMeta(kind schema.GroupVersionKind) strategicpatch.LookupPatchMeta {
+func (t *tracker) LookupPatchMeta(obj runtime.Object) strategicpatch.LookupPatchMeta {
 
-	if compatibleScheme, ok := t.scheme.(interface {
-		PatchMeta(kind schema.GroupVersionKind) strategicpatch.LookupPatchMeta
-	}); ok {
+	kind := obj.GetObjectKind().GroupVersionKind()
+
+	if compatibleScheme, ok := t.scheme.(SchemeWithPatchMeta); ok {
 		return compatibleScheme.PatchMeta(kind)
 	}
 
@@ -250,14 +249,6 @@ func (t *tracker) LookupPatchMeta(kind schema.GroupVersionKind) strategicpatch.L
 }
 
 var _ ObjectTracker = &tracker{}
-
-type nilPatchMeta struct {
-	ObjectScheme
-}
-
-func (n *nilPatchMeta) PatchMeta(kind schema.GroupVersionKind) strategicpatch.LookupPatchMeta {
-	return nil
-}
 
 // NewObjectTracker returns an ObjectTracker that can be used to keep track
 // of objects for the fake clientset. Mostly useful for unit tests.
@@ -510,6 +501,23 @@ func (t *tracker) Delete(gvr schema.GroupVersionResource, ns, name string) error
 		w.Delete(obj.DeepCopyObject())
 	}
 	return nil
+}
+
+type SchemeWithPatchMeta interface {
+	PatchMeta(kind schema.GroupVersionKind) strategicpatch.LookupPatchMeta
+}
+
+func NewSchemeWithPatchMeta(scheme *runtime.Scheme, patchMeta map[schema.GroupVersionKind]strategicpatch.LookupPatchMeta) *schemeWithPatchMeta {
+	return &schemeWithPatchMeta{scheme, patchMeta}
+}
+
+type schemeWithPatchMeta struct {
+	*runtime.Scheme
+	patchMeta map[schema.GroupVersionKind]strategicpatch.LookupPatchMeta
+}
+
+func (s *schemeWithPatchMeta) PatchMeta(kind schema.GroupVersionKind) strategicpatch.LookupPatchMeta {
+	return s.patchMeta[kind]
 }
 
 // filterByNamespace returns all objects in the collection that

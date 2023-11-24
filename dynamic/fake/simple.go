@@ -64,9 +64,8 @@ func NewSimpleDynamicClient(scheme *runtime.Scheme, objects ...runtime.Object) *
 			unstructuredScheme.AddKnownTypeWithName(gvk, &unstructured.UnstructuredList{})
 		}
 	}
-	return newDynamicClient(unstructuredScheme, defaultGvrToListMapping(unstructuredScheme), defaultPatchMetaInformation(scheme), objects...)
 
-	return NewSimpleDynamicClientWithCustomListKinds(unstructuredScheme, nil, objects...)
+	return newDynamicClient(unstructuredScheme, defaultGvrToListMapping(unstructuredScheme), defaultPatchMetaInformation(scheme), objects...)
 }
 
 // NewSimpleDynamicClientWithCustomListKinds try not to use this.  In general you want to have the scheme have the List types registered
@@ -137,15 +136,10 @@ func defaultGvrToListMapping(scheme *runtime.Scheme) map[schema.GroupVersionReso
 	return completeGVRToListKind
 }
 
-type schemeWithPatchMeta struct {
-	*runtime.Scheme
-	patchMeta map[schema.GroupVersionKind]strategicpatch.LookupPatchMeta
-}
-
 func newDynamicClient(scheme *runtime.Scheme, gvrToListKind map[schema.GroupVersionResource]string, patchMeta map[schema.GroupVersionKind]strategicpatch.LookupPatchMeta, objects ...runtime.Object) *FakeDynamicClient {
 
 	codecs := serializer.NewCodecFactory(scheme)
-	o := testing.NewObjectTracker(&schemeWithPatchMeta{Scheme: scheme, patchMeta: patchMeta}, codecs.UniversalDecoder())
+	o := testing.NewObjectTracker(testing.NewSchemeWithPatchMeta(scheme, patchMeta), codecs.UniversalDecoder())
 	for _, obj := range objects {
 		if err := o.Add(obj); err != nil {
 			panic(err)
