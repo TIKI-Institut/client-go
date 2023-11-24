@@ -18,6 +18,9 @@ package testing
 
 import (
 	"fmt"
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/json"
+	"k8s.io/apimachinery/pkg/util/strategicpatch"
 	"math/rand"
 	"strconv"
 	"sync"
@@ -261,20 +264,84 @@ func TestWatchAddAfterStop(t *testing.T) {
 	}
 }
 
-func TestPatchWithMissingObject(t *testing.T) {
-	nodesResource := schema.GroupVersionResource{Group: "", Version: "v1", Resource: "nodes"}
-
-	scheme := runtime.NewScheme()
-	codecs := serializer.NewCodecFactory(scheme)
-	o := NewObjectTracker(scheme, codecs.UniversalDecoder())
-	reaction := ObjectReaction(o)
-	action := NewRootPatchSubresourceAction(nodesResource, "node-1", types.StrategicMergePatchType, []byte(`{}`))
-	handled, node, err := reaction(action)
-	assert.True(t, handled)
-	assert.Nil(t, node)
-	assert.EqualError(t, err, `nodes "node-1" not found`)
+type schemeWithPatchMeta struct {
+	*runtime.Scheme
+	patchMeta map[schema.GroupVersionKind]strategicpatch.LookupPatchMeta
 }
 
+func (s *schemeWithPatchMeta) PatchMeta(kind schema.GroupVersionKind) strategicpatch.LookupPatchMeta {
+	return s.patchMeta[kind]
+}
+
+func TestPatch(t *testing.T) {
+
+	t.Run("WithMissingObject", func(t *testing.T) {
+		nodesResource := schema.GroupVersionResource{Group: "", Version: "v1", Resource: "nodes"}
+
+		scheme := runtime.NewScheme()
+		codecs := serializer.NewCodecFactory(scheme)
+		o := NewObjectTracker(scheme, codecs.UniversalDecoder())
+		reaction := ObjectReaction(o)
+		action := NewRootPatchSubresourceAction(nodesResource, "node-1", types.StrategicMergePatchType, []byte(`{}`))
+		handled, node, err := reaction(action)
+		assert.True(t, handled)
+		assert.Nil(t, node)
+		assert.EqualError(t, err, `nodes "node-1" not found`)
+	})
+
+	t.Run("PatchingProperty", func(t *testing.T) {
+		configmapsResource := schema.GroupVersionResource{Group: "", Version: "v1", Resource: "configmaps"}
+		configmapsGvk := schema.GroupVersionKind{Group: "", Version: "v1", Kind: "ConfigMap"}
+
+		targetObject := &v1.ConfigMap{}
+
+		scheme := runtime.NewScheme()
+		scheme.AddKnownTypeWithName(configmapsGvk, targetObject)
+
+		codecs := serializer.NewCodecFactory(scheme)
+
+		targetMeta, err := strategicpatch.NewPatchMetaFromStruct(targetObject)
+		assert.NoError(t, err)
+
+		schemeWithPatchMeta := schemeWithPatchMeta{
+			Scheme: scheme,
+			patchMeta: map[schema.GroupVersionKind]strategicpatch.LookupPatchMeta{
+				configmapsGvk: targetMeta,
+			},
+		}
+
+		o := NewObjectTracker(&schemeWithPatchMeta, codecs.UniversalDecoder())
+
+		unstructuredObj := &unstructured.Unstructured{
+			Object: map[string]interface{}{
+				"kind":       "ConfigMap",
+				"apiVersion": "v1",
+				"metadata": map[string]interface{}{
+					"name":      "cm-1",
+					"namespace": "cm-namespace",
+				},
+				"data": map[string]interface{}{"field-1": "A", "field-2": "B"},
+			},
+		}
+		expected := unstructuredObj.DeepCopy()
+		expected.Object["data"] = map[string]interface{}{"field-1": "C", "field-2": "B"}
+
+		err = o.Add(unstructuredObj)
+		assert.NoError(t, err)
+
+		reaction := ObjectReaction(o)
+		action := NewPatchAction(configmapsResource, "cm-namespace", "cm-1", types.StrategicMergePatchType, []byte(`{"data":{"field-1":"C"}}`))
+		handled, changedCm, err := reaction(action)
+		assert.NoError(t, err)
+		assert.True(t, handled)
+		assert.EqualValues(t, expected, changedCm)
+
+		trackedObject, err := o.Get(configmapsResource, "cm-namespace", "cm-1")
+		assert.NoError(t, err)
+		assert.EqualValues(t, expected, trackedObject)
+
+	})
+}
 func TestGetWithExactMatch(t *testing.T) {
 	scheme := runtime.NewScheme()
 	codecs := serializer.NewCodecFactory(scheme)
@@ -407,4 +474,46 @@ func Test_resourceCovers(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestStrategicMergePatch(t *testing.T) {
+	//StrategicMergePatch is not supposed to be called with an *unstructured.Unstructured as reference for the underlying schema
+
+	//local entries in dynamic fake client will always be of type *unstructured.Unstructured (see: dynamic/fake/simple.go:50 "objects, err := convertObjectsToUnstructured(scheme, objects)")
+	unstructuredObj := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"kind":       "ConfigMap",
+			"apiVersion": "v1",
+			"metadata": map[string]interface{}{
+				"name":      "some-config-map",
+				"namespace": "some-namespace",
+			},
+			"data": map[string]interface{}{
+				"foo":  "bar",
+				"john": "doe",
+			},
+		},
+	}
+
+	//the expected object shall no longer have the 'data' property
+	expectedObj := unstructuredObj.DeepCopy()
+	expectedObj.Object["data"] = map[string]interface{}{"foo": "foobar", "john": "doe"}
+	expectedObjBytes, err := json.Marshal(expectedObj)
+	assert.NoError(t, err)
+
+	unstructuredObjBytes, err := json.Marshal(unstructuredObj)
+	assert.NoError(t, err)
+
+	t.Run("using no struct", func(t *testing.T) {
+		outObj, err := strategicpatch.StrategicMergePatch(unstructuredObjBytes, []byte(`{"data":{"foo": "foobar"}}`), unstructuredObj)
+		assert.EqualError(t, err, `unable to find api field in struct Unstructured for the json field "data"`)
+		assert.Nil(t, outObj)
+	})
+
+	t.Run("using struct", func(t *testing.T) {
+		outObj, err := strategicpatch.StrategicMergePatch(unstructuredObjBytes, []byte(`{"data":{"foo": "foobar"}}`), &v1.ConfigMap{})
+		assert.NoError(t, err)
+		assert.Equal(t, expectedObjBytes, outObj, "object mismatch")
+	})
+
 }

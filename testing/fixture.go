@@ -66,6 +66,9 @@ type ObjectTracker interface {
 	// Watch watches objects from the tracker. Watch returns a channel
 	// which will push added / modified / deleted object.
 	Watch(gvr schema.GroupVersionResource, ns string) (watch.Interface, error)
+
+	// LookupPatchMeta returns the needed meta information to perform patches on any object with schema.GroupVersionKind <kind>.
+	LookupPatchMeta(kind schema.GroupVersionKind) strategicpatch.LookupPatchMeta
 }
 
 // ObjectScheme abstracts the implementation of common operations on objects.
@@ -155,8 +158,10 @@ func ObjectReaction(tracker ObjectTracker) ReactionFunc {
 
 			// reset the object in preparation to unmarshal, since unmarshal does not guarantee that fields
 			// in obj that are removed by patch are cleared
-			value := reflect.ValueOf(obj)
-			value.Elem().Set(reflect.New(value.Type().Elem()).Elem())
+			resetObj := func(obj runtime.Object) {
+				value := reflect.ValueOf(obj)
+				value.Elem().Set(reflect.New(value.Type().Elem()).Elem())
+			}
 
 			switch action.GetPatchType() {
 			case types.JSONPatchType:
@@ -169,6 +174,7 @@ func ObjectReaction(tracker ObjectTracker) ReactionFunc {
 					return true, nil, err
 				}
 
+				resetObj(obj)
 				if err = json.Unmarshal(modified, obj); err != nil {
 					return true, nil, err
 				}
@@ -178,14 +184,28 @@ func ObjectReaction(tracker ObjectTracker) ReactionFunc {
 					return true, nil, err
 				}
 
+				resetObj(obj)
 				if err := json.Unmarshal(modified, obj); err != nil {
 					return true, nil, err
 				}
 			case types.StrategicMergePatchType, types.ApplyPatchType:
-				mergedByte, err := strategicpatch.StrategicMergePatch(old, action.GetPatch(), obj)
+				objGvk := obj.GetObjectKind().GroupVersionKind()
+
+				schema := tracker.LookupPatchMeta(objGvk)
+				if schema == nil {
+					schema, err = strategicpatch.NewPatchMetaFromStruct(obj)
+					if err != nil {
+						return true, nil, err
+					}
+				}
+
+				mergedByte, err := strategicpatch.StrategicMergePatchUsingLookupPatchMeta(old, action.GetPatch(), schema)
+				//mergedByte, err := strategicpatch.StrategicMergePatch(old, action.GetPatch(), dataStruct)
 				if err != nil {
 					return true, nil, err
 				}
+
+				resetObj(obj)
 				if err = json.Unmarshal(mergedByte, obj); err != nil {
 					return true, nil, err
 				}
@@ -218,7 +238,26 @@ type tracker struct {
 	watchers map[schema.GroupVersionResource]map[string][]*watch.RaceFreeFakeWatcher
 }
 
+func (t *tracker) LookupPatchMeta(kind schema.GroupVersionKind) strategicpatch.LookupPatchMeta {
+
+	if compatibleScheme, ok := t.scheme.(interface {
+		PatchMeta(kind schema.GroupVersionKind) strategicpatch.LookupPatchMeta
+	}); ok {
+		return compatibleScheme.PatchMeta(kind)
+	}
+
+	return nil
+}
+
 var _ ObjectTracker = &tracker{}
+
+type nilPatchMeta struct {
+	ObjectScheme
+}
+
+func (n *nilPatchMeta) PatchMeta(kind schema.GroupVersionKind) strategicpatch.LookupPatchMeta {
+	return nil
+}
 
 // NewObjectTracker returns an ObjectTracker that can be used to keep track
 // of objects for the fake clientset. Mostly useful for unit tests.
