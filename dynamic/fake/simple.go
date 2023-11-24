@@ -152,7 +152,7 @@ func newDynamicClient(scheme *runtime.Scheme, gvrToListKind map[schema.GroupVers
 		}
 	}
 
-	cs := &FakeDynamicClient{scheme: scheme, gvrToListKind: gvrToListKind, knownPatchMeta: patchMeta}
+	cs := &FakeDynamicClient{scheme: scheme, gvrToListKind: gvrToListKind, knownPatchMeta: patchMeta, tracker: o}
 	cs.AddReactor("*", "*", testing.ObjectReaction(o))
 	cs.AddWatchReactor("*", func(action testing.Action) (handled bool, ret watch.Interface, err error) {
 		gvr := action.GetResource()
