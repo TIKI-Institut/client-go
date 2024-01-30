@@ -19,6 +19,8 @@ package fake
 import (
 	"context"
 	"fmt"
+	"k8s.io/apimachinery/pkg/util/strategicpatch"
+	"reflect"
 	"strings"
 
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -63,7 +65,7 @@ func NewSimpleDynamicClient(scheme *runtime.Scheme, objects ...runtime.Object) *
 		}
 	}
 
-	return NewSimpleDynamicClientWithCustomListKinds(unstructuredScheme, nil, objects...)
+	return newDynamicClient(unstructuredScheme, defaultGvrToListMapping(unstructuredScheme), defaultPatchMetaInformation(scheme), objects...)
 }
 
 // NewSimpleDynamicClientWithCustomListKinds try not to use this.  In general you want to have the scheme have the List types registered
@@ -74,18 +76,7 @@ func NewSimpleDynamicClientWithCustomListKinds(scheme *runtime.Scheme, gvrToList
 	// Since the base fake client needs the listGVK passed through the action (in cases where there are no instances, it
 	// cannot look up the actual hits), we need to know a mapping of GVR to listGVK here.  For GETs and other types of calls,
 	// there is no return value that contains a GVK, so it doesn't have to know the mapping in advance.
-
-	// first we attempt to invert known List types from the scheme to auto guess the resource with unsafe guesses
-	// this covers common usage of registering types in scheme and passing them
-	completeGVRToListKind := map[schema.GroupVersionResource]string{}
-	for listGVK := range scheme.AllKnownTypes() {
-		if !strings.HasSuffix(listGVK.Kind, "List") {
-			continue
-		}
-		nonListGVK := listGVK.GroupVersion().WithKind(listGVK.Kind[:len(listGVK.Kind)-4])
-		plural, _ := meta.UnsafeGuessKindToResource(nonListGVK)
-		completeGVRToListKind[plural] = listGVK.Kind
-	}
+	completeGVRToListKind := defaultGvrToListMapping(scheme)
 
 	for gvr, listKind := range gvrToListKind {
 		if !strings.HasSuffix(listKind, "List") {
@@ -103,15 +94,59 @@ func NewSimpleDynamicClientWithCustomListKinds(scheme *runtime.Scheme, gvrToList
 		completeGVRToListKind[gvr] = listKind
 	}
 
+	return newDynamicClient(scheme, completeGVRToListKind, defaultPatchMetaInformation(scheme), objects...)
+}
+
+func defaultPatchMetaInformation(scheme *runtime.Scheme) map[schema.GroupVersionKind]strategicpatch.LookupPatchMeta {
+	knownPatchMeta := map[schema.GroupVersionKind]strategicpatch.LookupPatchMeta{}
+
+	filterType := unstructured.Unstructured{}
+
+	for gvk, t := range scheme.AllKnownTypes() {
+		//collect underlying patch meta information
+		if _, known := knownPatchMeta[gvk]; !known {
+			// Get the underlying type for pointers
+			if t.Kind() == reflect.Ptr {
+				t = t.Elem()
+			}
+
+			//only accept types not equal to *unstructured.UnstructuredList bcs they are not supported by
+			if t != reflect.TypeOf(filterType) {
+				knownPatchMeta[gvk] = strategicpatch.PatchMetaFromStruct{T: t}
+			}
+
+		}
+	}
+
+	return knownPatchMeta
+}
+
+func defaultGvrToListMapping(scheme *runtime.Scheme) map[schema.GroupVersionResource]string {
+	// first we attempt to invert known List types from the scheme to auto guess the resource with unsafe guesses
+	// this covers common usage of registering types in scheme and passing them
+	completeGVRToListKind := map[schema.GroupVersionResource]string{}
+	for listGVK := range scheme.AllKnownTypes() {
+		if !strings.HasSuffix(listGVK.Kind, "List") {
+			continue
+		}
+		nonListGVK := listGVK.GroupVersion().WithKind(listGVK.Kind[:len(listGVK.Kind)-4])
+		plural, _ := meta.UnsafeGuessKindToResource(nonListGVK)
+		completeGVRToListKind[plural] = listGVK.Kind
+	}
+	return completeGVRToListKind
+}
+
+func newDynamicClient(scheme *runtime.Scheme, gvrToListKind map[schema.GroupVersionResource]string, patchMeta map[schema.GroupVersionKind]strategicpatch.LookupPatchMeta, objects ...runtime.Object) *FakeDynamicClient {
+
 	codecs := serializer.NewCodecFactory(scheme)
-	o := testing.NewObjectTracker(scheme, codecs.UniversalDecoder())
+	o := testing.NewObjectTracker(testing.NewSchemeWithPatchMeta(scheme, patchMeta), codecs.UniversalDecoder())
 	for _, obj := range objects {
 		if err := o.Add(obj); err != nil {
 			panic(err)
 		}
 	}
 
-	cs := &FakeDynamicClient{scheme: scheme, gvrToListKind: completeGVRToListKind, tracker: o}
+	cs := &FakeDynamicClient{scheme: scheme, gvrToListKind: gvrToListKind, knownPatchMeta: patchMeta, tracker: o}
 	cs.AddReactor("*", "*", testing.ObjectReaction(o))
 	cs.AddWatchReactor("*", func(action testing.Action) (handled bool, ret watch.Interface, err error) {
 		gvr := action.GetResource()
@@ -131,9 +166,10 @@ func NewSimpleDynamicClientWithCustomListKinds(scheme *runtime.Scheme, gvrToList
 // you want to test easier.
 type FakeDynamicClient struct {
 	testing.Fake
-	scheme        *runtime.Scheme
-	gvrToListKind map[schema.GroupVersionResource]string
-	tracker       testing.ObjectTracker
+	scheme         *runtime.Scheme
+	gvrToListKind  map[schema.GroupVersionResource]string
+	knownPatchMeta map[schema.GroupVersionKind]strategicpatch.LookupPatchMeta
+	tracker        testing.ObjectTracker
 }
 
 type dynamicResourceClient struct {
